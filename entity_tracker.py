@@ -151,45 +151,25 @@ def filter_detections(dets, frame_area, area_frac_max=0.75, nms_iou_thresh=0.5, 
     return kept
 
 
-def track_prompted_entities(video_path, prompt_specs, check_interval=15, stale_frames=10,
-                             match_iou_thresh=0.2, center_close_factor=0.4,
-                             box_threshold=0.3, text_threshold=0.25,
-                             max_concurrent_per_label=4, area_frac_max=0.75, verbose=True):
-    """prompt_specs: list of (label, category, text_prompt), e.g.
-    [("hand", "hand", "a hand."), ("lettuce", "object", "lettuce.")].
-    box_threshold/text_threshold default to 0.3/0.25 (not the official repo's
-    0.4/0.3 default) -- validated on the lettuce clip to be the difference
-    between finding both hands vs. only the one clearly-visible one.
-
-    Returns: dict obj_id -> {
-        "label": str, "category": str,
-        "first_frame": int, "last_frame": int (last frame with a non-empty mask),
-        "seed_mask": HxW bool array at the first frame the mask was non-empty
-                     (only this one frame's pixels are retained -- keeping a
-                     full per-frame mask stack for a whole clip x many
-                     instances would be too large; downstream point-picking
-                     only ever needs the seed frame),
-        "visible": {frame_idx: bool},
-        "gdino_score": float (score at the seeding detection),
-    }
+def _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_area,
+                   start_frame, end_frame, check_interval, stale_frames,
+                   match_iou_thresh, center_close_factor, box_threshold, text_threshold,
+                   max_concurrent_per_label, area_frac_max, verbose):
+    """Runs the periodic detect+propagate scan over [start_frame, end_frame)
+    of `state` (already init_state'd for the whole video the caller cares
+    about -- this function only ever reads/writes within that range) and
+    returns a meta dict exactly like track_prompted_entities' docstring
+    describes, with obj_ids local to THIS window starting at 1 (windows are
+    treated as independent instance sets -- no identity is carried across
+    a window boundary, by design: each chunk gets its own trajectory).
     """
-    predictor = load_sam2_predictor()
-    state = predictor.init_state(video_path=video_path)
-
-    decord.bridge.set_bridge("native")
-    vr = decord.VideoReader(video_path)
-    n_frames = len(vr)
-    frame0 = vr[0].asnumpy()
-    frame_h, frame_w = frame0.shape[0], frame0.shape[1]
-    frame_area = frame_h * frame_w
-
     active = {}   # obj_id -> {"label", "empty_streak", "last_box"}
-    meta = {}     # obj_id -> instance record (see docstring)
+    meta = {}     # obj_id -> instance record (see track_prompted_entities docstring)
     next_obj_id = 1
 
-    checkpoint = 0
-    while checkpoint < n_frames:
-        span = min(check_interval, n_frames - checkpoint)
+    checkpoint = start_frame
+    while checkpoint < end_frame:
+        span = min(check_interval, end_frame - checkpoint)
 
         for obj_id in list(active.keys()):
             if active[obj_id]["empty_streak"] >= stale_frames:
@@ -257,8 +237,112 @@ def track_prompted_entities(video_path, prompt_specs, check_interval=15, stale_f
 
         checkpoint += span
 
+    return meta
+
+
+def track_prompted_entities(video_path, prompt_specs, check_interval=15, stale_frames=10,
+                             match_iou_thresh=0.2, center_close_factor=0.4,
+                             box_threshold=0.3, text_threshold=0.25,
+                             max_concurrent_per_label=4, area_frac_max=0.75,
+                             detect_frame_limit=None, start_frame=0, verbose=True):
+    """prompt_specs: list of (label, category, text_prompt), e.g.
+    [("hand", "hand", "a hand."), ("lettuce", "object", "lettuce.")].
+    box_threshold/text_threshold default to 0.3/0.25 (not the official repo's
+    0.4/0.3 default) -- validated on the lettuce clip to be the difference
+    between finding both hands vs. only the one clearly-visible one.
+
+    detect_frame_limit: if set, stop scanning/seeding new entities once
+        `checkpoint` reaches this frame -- entities first spotted beyond it
+        can never be handed to stage 2 anyway (its own STv2 window is capped
+        the same way), so there's no point spending GroundingDINO/SAM2 budget
+        discovering them. None (default) scans the whole clip, preserving the
+        old behavior for standalone/CLI use.
+
+    start_frame: scan begins here instead of frame 0 (single-window use only
+        -- for processing many windows of the same video without reloading
+        GDINO/SAM2 or re-decoding the video each time, see
+        track_prompted_entities_chunks below).
+
+    Returns: dict obj_id -> {
+        "label": str, "category": str,
+        "first_frame": int, "last_frame": int (last frame with a non-empty mask),
+        "seed_mask": HxW bool array at the first frame the mask was non-empty
+                     (only this one frame's pixels are retained -- keeping a
+                     full per-frame mask stack for a whole clip x many
+                     instances would be too large; downstream point-picking
+                     only ever needs the seed frame),
+        "visible": {frame_idx: bool},
+        "gdino_score": float (score at the seeding detection),
+    }
+    """
+    predictor = load_sam2_predictor()
+    state = predictor.init_state(video_path=video_path)
+
+    decord.bridge.set_bridge("native")
+    vr = decord.VideoReader(video_path)
+    n_frames = len(vr)
+    scan_frames = n_frames if detect_frame_limit is None else min(n_frames, detect_frame_limit)
+    frame0 = vr[0].asnumpy()
+    frame_h, frame_w = frame0.shape[0], frame0.shape[1]
+    frame_area = frame_h * frame_w
+
+    meta = _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_area,
+                          start_frame, scan_frames, check_interval, stale_frames,
+                          match_iou_thresh, center_close_factor, box_threshold, text_threshold,
+                          max_concurrent_per_label, area_frac_max, verbose)
+
     predictor.reset_state(state)
-    return {"meta": meta, "frame_size": (frame_h, frame_w), "n_frames": n_frames}
+    return {"meta": meta, "frame_size": (frame_h, frame_w), "n_frames": n_frames, "frames_scanned": scan_frames}
+
+
+def track_prompted_entities_chunks(video_path, prompt_specs, chunk_starts, max_frames,
+                                    check_interval=15, stale_frames=10,
+                                    match_iou_thresh=0.2, center_close_factor=0.4,
+                                    box_threshold=0.3, text_threshold=0.25,
+                                    max_concurrent_per_label=4, area_frac_max=0.75,
+                                    offload_video_to_cpu=True, verbose=True):
+    """Same detection+tracking as track_prompted_entities, but for MANY
+    non-overlapping windows ("chunks") of the same video in one call --
+    GDINO/SAM2 are loaded once, the video is decoded into SAM2's state once
+    (init_state), and each chunk only pays for predictor.reset_state (which
+    clears object-tracking bookkeeping WITHOUT re-decoding the video --
+    confirmed against the installed sam2 package's
+    SAM2VideoPredictor.reset_state/init_state source) rather than a full
+    reload. offload_video_to_cpu defaults True here (unlike the single-window
+    function) since a chunked run is meant for longer videos where holding
+    every decoded frame on GPU at once is more likely to matter.
+
+    chunk_starts: list of frame indices (into this video_path) where each
+        chunk begins; each chunk covers [start, min(n_frames, start+max_frames)).
+        See frame_sampling.compute_chunk_starts.
+
+    Returns: {"n_frames": int, "frame_size": (h, w),
+              "chunks": [{"chunk_start": int, "chunk_end": int, "meta": {...}}, ...]}
+    """
+    predictor = load_sam2_predictor()
+    state = predictor.init_state(video_path=video_path, offload_video_to_cpu=offload_video_to_cpu)
+
+    decord.bridge.set_bridge("native")
+    vr = decord.VideoReader(video_path)
+    n_frames = len(vr)
+    frame0 = vr[0].asnumpy()
+    frame_h, frame_w = frame0.shape[0], frame0.shape[1]
+    frame_area = frame_h * frame_w
+
+    chunks = []
+    for chunk_start in chunk_starts:
+        predictor.reset_state(state)
+        chunk_end = min(n_frames, chunk_start + max_frames)
+        if verbose:
+            print(f"--- chunk [{chunk_start}, {chunk_end}) ---")
+        meta = _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_area,
+                              chunk_start, chunk_end, check_interval, stale_frames,
+                              match_iou_thresh, center_close_factor, box_threshold, text_threshold,
+                              max_concurrent_per_label, area_frac_max, verbose)
+        chunks.append({"chunk_start": chunk_start, "chunk_end": chunk_end, "meta": meta})
+
+    predictor.reset_state(state)
+    return {"n_frames": n_frames, "frame_size": (frame_h, frame_w), "chunks": chunks}
 
 
 if __name__ == "__main__":

@@ -1,13 +1,21 @@
-"""Stage 3 (runs in the `trace_stv2` conda env -- no SpaTrackerV2 checkout
-needed, unlike stage2_lift3d.py, since this only reads the npz's stage 2
-already produced): combined trace visualization. Generalizes
-render_novel_view.py's chase-cam rig +
-draw_trail/draw_marker (previously used for exactly ONE tracked query point)
-to every instance x every FPS-sampled point saved by stage2_lift3d.py, in a
-2x2 grid: original view (top-left), novel chase-cam angle (top-right),
-a fixed reference frame with the cumulative 2D trajectory drawn on it so far
+"""Stage 3 (runs in the `trace_stv2` conda env; needs the SpaTrackerV2
+checkout on PYTHONPATH like stage2_lift3d.py, since it imports from there):
+combined trace visualization for ONE already-processed segment, in a 2x2
+grid: original view (top-left), novel chase-cam angle (top-right), a fixed
+reference frame with the cumulative 2D trajectory drawn on it so far
 (bottom-left), and a blank panel reserved for future use (bottom-right).
 Each instance in its own color with a legend.
+
+This does NOT read a persisted scene.npz (there isn't one -- stage2_lift3d.py
+never writes one, see its module docstring). Instead it redownloads+
+resamples the segment fresh from S3 (same recipe stage 1/2 used, read back
+out of the segment's bundle.json) and reruns JUST the front-end + grid-BA
+pass (stage2_lift3d.run_frontend_and_grid) to get fresh dense depth +
+camera poses + RGB -- the entity call is skipped entirely, since each
+instance's points3d/points2d/visibility were already computed and saved by
+stage 2 (<segment>_trace_<instance>.npz) and just get loaded here. The
+downloaded/resampled clip is deleted afterward, same as every other stage --
+only the rendered mp4 persists.
 
 The chase-cam auto-aim rig (local_rig) and the vectorized z-buffer point
 splat (render_novel) are copied verbatim from render_novel_view.py -- both
@@ -24,14 +32,20 @@ unlike the top-left panel's short decaying trail_len window, this shows the
 whole path traced out so far against a static background.
 """
 import argparse
+import glob
 import json
 import os
 
 import numpy as np
 import torch
 import cv2
+import decord
 import imageio.v2 as imageio
 from tqdm import tqdm
+
+from frame_sampling import resample_video
+from dataset_io import download_segment, load_manifest_range, cleanup
+from stage2_lift3d import run_frontend_and_grid, free_fg, load_models
 
 INSTANCE_COLORS = [
     (230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
@@ -162,50 +176,19 @@ def render_novel(pts_world, colors, valid, K_novel, w2c_novel, H, W, device, spl
     return img.clamp(0, 1).cpu().numpy()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--summary", required=True, help="stage2_lift3d.py's <clip>_trace_summary.json")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--side-frac", type=float, default=1.0)
-    ap.add_argument("--back-frac", type=float, default=1.0)
-    ap.add_argument("--height-frac", type=float, default=0.4)
-    ap.add_argument("--target-frac", type=float, default=1.5)
-    ap.add_argument("--fixed", action="store_true", help="hold the novel camera fixed (frame-0 pose) instead of chase-cam")
-    ap.add_argument("--fps", type=float, default=None,
-                     help="output video fps. Defaults to the source clip's own fps (from the trace summary) "
-                          "so playback speed matches real time; pass a value explicitly to override (e.g. "
-                          "for deliberate slow-motion).")
-    ap.add_argument("--splat", type=int, default=1)
-    ap.add_argument("--trail-len", type=int, default=7)
-    ap.add_argument("--ref-frame", type=int, default=0,
-                     help="frame index to hold fixed as the background of the bottom-left reference panel, "
-                          "onto which each instance's cumulative points2d trail (seed_frame..t) is drawn.")
-    args = ap.parse_args()
-
-    with open(args.summary) as f:
-        summary = json.load(f)
-    out_dir = os.path.dirname(os.path.abspath(args.summary))
-
-    if args.fps is None:
-        args.fps = summary.get("fps") or 12
-        print(f"--fps not given, using source clip fps from trace summary: {args.fps:.2f}")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if not summary.get("scene_file"):
-        raise RuntimeError(
-            "No scene_file in trace summary -- stage2_lift3d.py was run without --save-scene, "
-            "so there's no video/depth/camera data to render from. Re-run stage2_lift3d.py with "
-            "--save-scene for this clip."
-        )
-    scene = np.load(os.path.join(out_dir, summary["scene_file"]))
-    video, depths = scene["video"], scene["depths"]
-    intrinsics, extrinsics = scene["intrinsics"], scene["extrinsics"]
-    T, C, H, W = video.shape
-    c2ws = np.linalg.inv(extrinsics)
+def render(fg, summary, chunk_dir, args, device):
+    """Renders the 2x2 video given fg (from run_frontend_and_grid) and the
+    segment's already-saved per-instance trajectory npz's (referenced by
+    `summary`, stage2_lift3d.py's *_trace_summary.json)."""
+    video_np = fg["video_np"]          # (T, C, H, W), 0..1
+    depths = fg["depth_save"].numpy()  # (T, H, W)
+    intrinsics = fg["intrs_np"]        # (T, 3, 3)
+    c2ws = fg["c2ws"].numpy()          # (T, 4, 4) -- already camera-to-world, no inversion needed
+    T, C, H, W = video_np.shape
 
     instances = []
     for i, inst in enumerate(summary["instances"]):
-        traj = np.load(os.path.join(out_dir, inst["trajectory_file"]))
+        traj = np.load(os.path.join(chunk_dir, inst["trajectory_file"]))
         instances.append({
             "label": inst["label"], "color": INSTANCE_COLORS[i % len(INSTANCE_COLORS)],
             "seed_frame": int(traj["seed_frame"]),
@@ -226,7 +209,7 @@ def main():
     print(f"median scene depth: {median_depth:.3f}, rig offset: {rig[:3,3].cpu().numpy()}, fixed={args.fixed}")
 
     ref_frame = max(0, min(args.ref_frame, T - 1))
-    ref_img_base = video[ref_frame].transpose(1, 2, 0).copy()
+    ref_img_base = video_np[ref_frame].transpose(1, 2, 0).copy()
     blank_img = np.full_like(ref_img_base, 0.12)
 
     def pixel_of(inst, t):
@@ -244,17 +227,18 @@ def main():
         return [inst["points3d"][lt, n] if inst["visibility"][lt, n] else None
                 for n in range(inst["points3d"].shape[1])]
 
-    writer = imageio.get_writer(args.out, fps=args.fps, codec="libx264", quality=8)
+    fps = args.fps if args.fps is not None else (summary.get("fps") or summary.get("actual_fps") or 12)
+    writer = imageio.get_writer(args.out, fps=fps, codec="libx264", quality=8)
     for t in tqdm(range(T)):
         d = torch.from_numpy(depths[t]).to(device)
         K = torch.from_numpy(intrinsics[t]).to(device)
         c2w = torch.from_numpy(c2ws[t]).to(device)
-        rgb = torch.from_numpy(video[t]).permute(1, 2, 0).to(device).float()
+        rgb = torch.from_numpy(video_np[t]).permute(1, 2, 0).to(device).float()
 
         w2c_novel = fixed_w2c_novel if args.fixed else torch.inverse(c2w @ rig)
         pts_world, valid = unproject(d, K, c2w, device)
         novel_img = render_novel(pts_world, rgb, valid, K_novel, w2c_novel, H, W, device, splat=args.splat)
-        orig_img = video[t].transpose(1, 2, 0).copy()
+        orig_img = video_np[t].transpose(1, 2, 0).copy()
         ref_img = ref_img_base.copy()
 
         for inst in instances:
@@ -277,9 +261,6 @@ def main():
                     if p is not None and 0 <= p[0] < W and 0 <= p[1] < H:
                         novel_img = draw_marker(novel_img, *p, color)
 
-                # Reference panel: cumulative trail from this instance's own seed_frame up to
-                # t (not clipped to trail_len) drawn on the fixed --ref-frame background, so
-                # the whole path traced out so far accumulates over the video's duration.
                 cum_trail_px = [pixel_of(inst, s)[n] for s in range(inst["seed_frame"], t + 1)]
                 ref_img = draw_trail(ref_img, cum_trail_px, color)
                 if pix_now[n] is not None:
@@ -295,6 +276,88 @@ def main():
         writer.append_data((np.clip(combined, 0, 1) * 255).astype(np.uint8))
     writer.close()
     print(f"Saved {args.out}")
+
+
+def run_manifest(args):
+    rows = load_manifest_range(args.manifest, args.index, args.index + 1)
+    if not rows:
+        raise SystemExit(f"No manifest row at index {args.index}")
+    row = rows[0]
+    seg_id = row["segment_id"]
+    chunk_dir = os.path.join(args.save_root, seg_id, f"{args.chunk_index:05d}")
+    bundle_path = os.path.join(chunk_dir, "bundle.json")
+    summary_candidates = glob.glob(os.path.join(chunk_dir, "*_trace_summary.json"))
+    if not os.path.exists(bundle_path) or not summary_candidates:
+        raise SystemExit(f"{chunk_dir} isn't fully processed yet -- need both bundle.json (stage 1) "
+                          f"and *_trace_summary.json (stage 2) before stage 3 can render it.")
+    with open(bundle_path) as f:
+        bundle = json.load(f)
+    with open(summary_candidates[0]) as f:
+        summary = json.load(f)
+
+    out_path = args.out or os.path.join(chunk_dir, f"{summary['clip_stem']}_trace_render.mp4")
+    if args.check_existing and os.path.exists(out_path):
+        print(f"[{seg_id}] {out_path} exists, skipping")
+        return
+    args.out = out_path
+
+    os.makedirs(args.tmp_dir, exist_ok=True)
+    seg_path = os.path.join(args.tmp_dir, f"{seg_id}_raw.mp4")
+    resampled_path = os.path.join(args.tmp_dir, f"{seg_id}_resampled.mp4")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        print(f"Downloading segment for {seg_id}...")
+        download_segment(bundle["bucket"], bundle["key"], bundle["start_sec"], bundle["duration_sec"], seg_path)
+        resample_video(seg_path, resampled_path, bundle["target_fps"], verbose=True)
+        decord.bridge.set_bridge("native")
+        vr = decord.VideoReader(resampled_path)
+
+        vggt4track_model, model = load_models(args.track_mode, args.vo_points)
+        native_h, native_w = bundle["resolution_hw"]
+        fg = run_frontend_and_grid(vr, bundle["chunk_start"], bundle["chunk_end"], native_h, native_w,
+                                    vggt4track_model, model, args.target_size, args.grid_size, args.vo_points)
+        try:
+            render(fg, summary, chunk_dir, args, device)
+        finally:
+            free_fg(fg)
+    finally:
+        cleanup(seg_path, resampled_path)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True, help="JSONL manifest from build_manifest_ego4d.py, "
+                     "same file/index used by stage1_detect.py/stage2_lift3d.py.")
+    ap.add_argument("--index", type=int, required=True, help="manifest row index of the segment to render")
+    ap.add_argument("--save-root", required=True, help="same --save-root stage1_detect.py/stage2_lift3d.py used")
+    ap.add_argument("--chunk-index", type=int, default=0)
+    ap.add_argument("--tmp-dir", default=os.path.expanduser("~/ego4d/scratch"),
+                     help="scratch directory for the downloaded/resampled clip -- deleted after rendering.")
+    ap.add_argument("--out", default=None, help="defaults to <chunk_dir>/<clip_stem>_trace_render.mp4")
+    ap.add_argument("--grid-size", type=int, default=20)
+    ap.add_argument("--vo-points", type=int, default=2000)
+    ap.add_argument("--target-size", type=int, default=1288)
+    ap.add_argument("--track-mode", default="offline")
+    ap.add_argument("--side-frac", type=float, default=1.0)
+    ap.add_argument("--back-frac", type=float, default=1.0)
+    ap.add_argument("--height-frac", type=float, default=0.4)
+    ap.add_argument("--target-frac", type=float, default=1.5)
+    ap.add_argument("--fixed", action="store_true", help="hold the novel camera fixed (frame-0 pose) instead of chase-cam")
+    ap.add_argument("--fps", type=float, default=None,
+                     help="output video fps. Defaults to the source clip's own fps (from the trace summary) "
+                          "so playback speed matches real time; pass a value explicitly to override (e.g. "
+                          "for deliberate slow-motion).")
+    ap.add_argument("--splat", type=int, default=1)
+    ap.add_argument("--trail-len", type=int, default=7)
+    ap.add_argument("--ref-frame", type=int, default=0,
+                     help="frame index to hold fixed as the background of the bottom-left reference panel, "
+                          "onto which each instance's cumulative points2d trail (seed_frame..t) is drawn.")
+    ap.add_argument("--check-existing", action="store_true", default=False,
+                     help="skip rendering if the output mp4 already exists (resume mode). Default is to "
+                          "overwrite/re-render.")
+    args = ap.parse_args()
+
+    run_manifest(args)
 
 
 if __name__ == "__main__":

@@ -84,8 +84,22 @@ def identify(video_path, narration=DEFAULT_NARRATION, fps=2.0, max_pixels=360 * 
         ],
     }]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt").to("cuda")
+    # return_video_metadata=True carries forward the real per-video VideoMetadata
+    # (native fps, total_num_frames, the exact frame indices) that
+    # process_vision_info computed when it decoded/sampled the video per the
+    # "fps" key above. Without this, processor() below has no metadata, assumes
+    # a fake native fps=24, and: (a) silently RE-samples the already-sampled
+    # frames down again (observed: our 6-frame, fps~1.76 clip got re-sampled to
+    # just 4 frames, hitting Qwen3VLVideoProcessor's min_frames floor), and
+    # (b) mislabels each frame's <N.M seconds> prompt tag using the fake fps.
+    # do_sample_frames=False (from video_kwargs) tells the processor these
+    # frames are already sampled -- don't sample again.
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        messages, return_video_kwargs=True, return_video_metadata=True)
+    videos = [v for v, m in video_inputs]
+    video_metadata = [m for v, m in video_inputs]
+    inputs = processor(text=[text], images=image_inputs, videos=videos, video_metadata=video_metadata,
+                        padding=True, return_tensors="pt", **video_kwargs).to("cuda")
     out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     out_trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
     raw = processor.batch_decode(out_trimmed, skip_special_tokens=True)[0]

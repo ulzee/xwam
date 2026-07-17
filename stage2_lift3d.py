@@ -1,5 +1,5 @@
-"""Stage 2 (runs in the `trace_stv2` conda env): loads stage1_detect.py's
-bundle JSON and lifts every instance's query points to 3D with
+"""Stage 2 (runs in the `trace_stv2` conda env): loads stage1a.py/
+stage1b.py's bundle JSON and lifts every instance's query points to 3D with
 SpatialTrackerV2.
 
 Lives in this pipeline repo, but `from models.SpaTrackV2...` below needs the
@@ -39,6 +39,15 @@ trajectory is the trustworthy one.
 query_no_BA is hardcoded to False for both calls (validated: ~22% less
 jitter on tracked points at equal compute, see project_spatialtrackerv2_jitter
 memory -- there is no scenario where the default True is preferable).
+
+The front-end + grid call (run_frontend_and_grid) is split out from the
+entity call + save (run_entity_call_and_save) so stage3_render.py can reuse
+JUST the former -- it needs fresh depth/camera-poses to render a novel view,
+but not the entity call, since points3d/points2d/visibility per instance are
+already saved here and don't need recomputing. No scene.npz is written
+anywhere: stage3_render.py redownloads+recomputes depth/poses on demand
+instead of reading a persisted one, so nothing here needs to save the raw
+video/depth/poses to disk either -- see stage3_render.py's docstring.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -57,6 +66,11 @@ from models.SpaTrackV2.models.predictor import Predictor
 from models.SpaTrackV2.models.utils import get_points_on_a_grid
 from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
 from models.SpaTrackV2.models.vggt4track.utils.load_fn import preprocess_image
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from frame_sampling import resample_video
+from dataset_io import download_segment, load_manifest_range, cleanup
 
 _T0 = time.time()
 
@@ -110,39 +124,26 @@ def unproject_tracked_pixel(depth, K, c2w, u, v, device, search=4):
     return (R @ pt_cam + t).cpu().numpy()
 
 
-def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_dir, clip_stem,
-                 vggt4track_model, model, target_size, grid_size, vo_points, save_scene,
-                 summary_extra=None):
-    """Runs the front-end pass + the two backend calls + unprojection + save
-    for ONE window [chunk_start, chunk_end) of frames read from the
-    already-open `vr`, reusing the ALREADY-LOADED vggt4track_model/model so
-    repeated calls (chunked mode) don't reload weights from HF each time --
-    only this window's GPU tensors are freed at the end, not the models.
+def run_frontend_and_grid(vr, chunk_start, chunk_end, native_h, native_w,
+                           vggt4track_model, model, target_size, grid_size, vo_points):
+    """Front-end pass + grid-BA call ONLY, for ONE window [chunk_start,
+    chunk_end) of frames read from the already-open `vr`, reusing the
+    ALREADY-LOADED vggt4track_model/model. This is the expensive, shared
+    part both stage2 (entity call + save, see run_entity_call_and_save) and
+    stage3_render.py (novel-view rendering, no entity call needed since
+    points3d is already saved) build on.
 
-    `instances` must already have LOCAL (window-relative, 0-indexed)
-    seed_frame/first_frame/last_frame values -- the caller is responsible for
-    that conversion when instances came from a chunked bundle whose frame
-    numbers are global into the shared resampled video (see
-    stage1_detect.py's run_chunked).
+    Returns a dict of everything downstream needs: dense depth (depth_save),
+    the grid call's bundle-adjusted camera poses (c2ws) and refined
+    intrinsics (intrs_np) -- the "trustworthy" camera trajectory -- plus the
+    front-end's own (unrefined) depth/intrinsics/extrinsics
+    (depth_tensor/intrs_frontend/extrs), which the entity call needs as its
+    own independent input priors, and the preprocessed RGB tensor.
 
-    Returns the summary dict, or None if no instances fell inside the window
-    (nothing to lift -- caller should skip/log, not treat as an error, since
-    this is an expected outcome for some chunks in bulk mode).
+    Caller owns freeing these GPU/CPU tensors when done (see free_fg below)
+    -- not freed here, since stage2 still needs them for the entity call
+    immediately after.
     """
-    max_frames = chunk_end - chunk_start
-    kept, skipped = [], []
-    for inst in instances:
-        if inst["seed_frame"] < max_frames:
-            kept.append(inst)
-        else:
-            skipped.append(inst)
-    if skipped:
-        log(f"Skipping {len(skipped)} instance(s) whose first appearance is beyond "
-            f"this window ({max_frames} frames): {[i['instance_id'] for i in skipped]}")
-    if not kept:
-        log("No instances fall within this window -- nothing to lift.")
-        return None
-
     video_tensor = torch.from_numpy(vr.get_batch(range(chunk_start, chunk_end)).asnumpy()).permute(0, 3, 1, 2).float()
     n_frames = video_tensor.shape[0]
     log(f"Loaded frames [{chunk_start},{chunk_end}) ({n_frames}f) at native {native_w}x{native_h}")
@@ -197,6 +198,55 @@ def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_d
     torch.cuda.empty_cache()
     log(f"Freed grid call tensors. VRAM in use: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
 
+    return {
+        "video_tensor": video_tensor, "video_np": video_np,
+        "depth_save": depth_save, "c2ws": c2ws, "intrs_np": intrs_np,
+        "depth_tensor": depth_tensor, "intrs_frontend": intrs_frontend, "extrs": extrs,
+        "unc_metric": unc_metric, "n_frames": n_frames,
+        "frame_h_pp": frame_h_pp, "frame_w_pp": frame_w_pp,
+    }
+
+
+def free_fg(fg):
+    """Frees the GPU/CPU tensors returned by run_frontend_and_grid. Call
+    once you're fully done with a window (after the entity call in stage2,
+    or after rendering in stage3)."""
+    for k in ("video_tensor", "video_np", "depth_save", "c2ws"):
+        fg.pop(k, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def run_entity_call_and_save(fg, instances, out_dir, clip_stem, model, native_h, native_w, target_size,
+                              summary_extra=None):
+    """Entity backend call + unprojection + per-instance npz + summary save,
+    given `fg` (the dict from run_frontend_and_grid for this same window).
+
+    `instances` must already have LOCAL (window-relative, 0-indexed)
+    seed_frame/first_frame/last_frame values -- the caller is responsible for
+    that conversion when instances came from a chunked bundle whose frame
+    numbers are global into the shared resampled video.
+
+    Returns the summary dict, or None if no instances fell inside the window
+    (nothing to lift -- caller should skip/log, not treat as an error, since
+    this is an expected outcome for some chunks in bulk mode).
+    """
+    n_frames = fg["n_frames"]
+    kept, skipped = [], []
+    for inst in instances:
+        if inst["seed_frame"] < n_frames:
+            kept.append(inst)
+        else:
+            skipped.append(inst)
+    if skipped:
+        log(f"Skipping {len(skipped)} instance(s) whose first appearance is beyond "
+            f"this window ({n_frames} frames): {[i['instance_id'] for i in skipped]}")
+    if not kept:
+        log("No instances fall within this window -- nothing to lift.")
+        return None
+
+    video_tensor = fg["video_tensor"]
+
     # --- Build the combined entity query set: every instance's own points, each at its own seed frame ---
     query_rows = []  # (t, x, y) in preprocessed-resolution pixel coords
     row_owner = []   # (instance_index, point_index)
@@ -213,9 +263,9 @@ def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_d
 
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         custom_out = model.forward(
-            video_tensor, depth=depth_tensor, intrs=intrs_frontend, extrs=extrs,
+            video_tensor, depth=fg["depth_tensor"], intrs=fg["intrs_frontend"], extrs=fg["extrs"],
             queries=query_xyt_entities, fps=1, full_point=True, iters_track=4,
-            query_no_BA=False, fixed_cam=False, stage=1, unc_metric=unc_metric,
+            query_no_BA=False, fixed_cam=False, stage=1, unc_metric=fg["unc_metric"],
             support_frame=n_frames - 1, replace_ratio=0.2)
     log(f"Entity call done. Peak VRAM: {torch.cuda.max_memory_allocated() / 1e9:.2f}GB")
     track2d_raw = custom_out[5]
@@ -244,8 +294,9 @@ def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_d
     pix = entity_track2d.numpy()  # (T, N, 2)
     vis_conf = entity_vis if entity_vis.ndim == 2 else entity_vis[:, None].repeat(n_pts_total, axis=1)
 
-    depth_save_dev = depth_save.to(device)
-    c2ws_dev = c2ws.to(device)
+    depth_save_dev = fg["depth_save"].to(device)
+    c2ws_dev = fg["c2ws"].to(device)
+    intrs_np = fg["intrs_np"]
     for t in range(n_frames):
         K_t = torch.from_numpy(intrs_np[t]).to(device)
         c2w_t = c2ws_dev[t]
@@ -289,23 +340,12 @@ def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_d
         log(f"  {inst['instance_id']}: {len(rows)} pts, tracked {n_frames - t0} frames, "
             f"{int(visibility.any(axis=1).sum())} with >=1 visible point -> {traj_file}")
 
-    if save_scene:
-        scene_file = f"{clip_stem}_scene.npz"
-        np.savez(os.path.join(out_dir, scene_file),
-                 video=video_np, depths=depth_save.numpy(), intrinsics=intrs_np,
-                 extrinsics=torch.inverse(c2ws).numpy())
-        log(f"Saved {scene_file}")
-    else:
-        scene_file = None
-        log("Skipping scene.npz (pass --save-scene to keep it, e.g. for stage3_render.py)")
-
     summary = {
         "clip_stem": clip_stem,
         "num_frames_used": n_frames,
         "resolution_hw_native": [native_h, native_w],
-        "resolution_hw_preprocessed": [frame_h_pp, frame_w_pp],
-        "target_size": target_size, "grid_size": grid_size, "vo_points": vo_points,
-        "scene_file": scene_file,
+        "resolution_hw_preprocessed": [fg["frame_h_pp"], fg["frame_w_pp"]],
+        "target_size": target_size,
         "instances": instances_summary,
         "skipped_instances": [i["instance_id"] for i in skipped],
     }
@@ -316,7 +356,7 @@ def lift_window(vr, chunk_start, chunk_end, native_h, native_w, instances, out_d
         json.dump(summary, f, indent=2)
     log(f"Saved {summary_path}")
 
-    del depth_save, c2ws, depth_save_dev, c2ws_dev, video_tensor, entity_track2d, video_np
+    del entity_track2d
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -352,29 +392,33 @@ def run_single(args):
     vr = decord.VideoReader(video_path)
     chunk_end = min(len(vr), args.max_frames)
 
-    lift_window(vr, 0, chunk_end, native_h, native_w, bundle["instances"], args.out_dir, clip_stem,
-                vggt4track_model, model, args.target_size, args.grid_size, args.vo_points, args.save_scene,
-                summary_extra={
-                    "video": video_path, "narration": bundle.get("narration"), "task": bundle.get("task"),
-                    "fps": bundle.get("fps"), "num_frames_total": bundle.get("num_frames"),
-                    "max_frames": args.max_frames,
-                })
+    fg = run_frontend_and_grid(vr, 0, chunk_end, native_h, native_w, vggt4track_model, model,
+                                args.target_size, args.grid_size, args.vo_points)
+    run_entity_call_and_save(
+        fg, bundle["instances"], args.out_dir, clip_stem, model, native_h, native_w, args.target_size,
+        summary_extra={
+            "video": video_path, "narration": bundle.get("narration"), "task": bundle.get("task"),
+            "fps": bundle.get("fps"), "num_frames_total": bundle.get("num_frames"),
+            "grid_size": args.grid_size, "vo_points": args.vo_points, "max_frames": args.max_frames,
+        })
+    free_fg(fg)
     log("Done.")
 
 
 def run_chunked(args):
-    """Bulk-annotation mode: processes every chunk stage1_detect.py's
-    run_chunked wrote under save_root/<video_stem>/<chunk_idx:05d>/bundle.json,
-    reusing one loaded VGGT4Track + Predictor pair and one open decord reader
-    (all chunks of a video share the same resampled video file) across all
-    chunks instead of reloading per chunk.
+    """Legacy single-video chunked mode: processes every chunk written under
+    save_root/<video_stem>/<chunk_idx:05d>/bundle.json (same layout stage1a.py/
+    stage1b.py's bulk mode writes, just keyed by video_stem instead of a
+    manifest segment_id), reusing one loaded
+    VGGT4Track + Predictor pair and one open decord reader (all chunks of a
+    video share the same resampled video file) across all chunks instead of
+    reloading per chunk.
     """
     clip_stem = os.path.splitext(os.path.basename(args.video))[0]
     video_dir = os.path.join(args.save_root, clip_stem)
     chunk_dirs = sorted(glob.glob(os.path.join(video_dir, "[0-9]" * 5)))
     if not chunk_dirs:
-        raise RuntimeError(f"No chunk directories found under {video_dir} -- run stage1_detect.py's "
-                            f"--save-root mode on this video first.")
+        raise RuntimeError(f"No chunk directories found under {video_dir}.")
     if args.chunk_index is not None:
         wanted = os.path.join(video_dir, f"{args.chunk_index:05d}")
         chunk_dirs = [d for d in chunk_dirs if d == wanted]
@@ -400,9 +444,6 @@ def run_chunked(args):
         log(f"=== chunk {bundle['chunk_index']:05d}/{bundle['num_chunks'] - 1} "
             f"[{chunk_start},{chunk_end}) ===")
 
-        # bundle.json stores GLOBAL frame numbers into the shared resampled
-        # video (so they stay meaningful/debuggable on their own); lift_window
-        # needs them LOCAL to this window, 0-indexed from chunk_start.
         local_instances = []
         for inst in bundle["instances"]:
             local = dict(inst)
@@ -411,9 +452,10 @@ def run_chunked(args):
             local["last_frame"] = inst["last_frame"] - chunk_start
             local_instances.append(local)
 
-        summary = lift_window(
-            vr, chunk_start, chunk_end, native_h, native_w, local_instances, chunk_dir, clip_stem,
-            vggt4track_model, model, args.target_size, args.grid_size, args.vo_points, args.save_scene,
+        fg = run_frontend_and_grid(vr, chunk_start, chunk_end, native_h, native_w, vggt4track_model, model,
+                                    args.target_size, args.grid_size, args.vo_points)
+        summary = run_entity_call_and_save(
+            fg, local_instances, chunk_dir, clip_stem, model, native_h, native_w, args.target_size,
             summary_extra={
                 "video": bundle["video"], "source_video": bundle.get("source_video"),
                 "narration": bundle.get("narration"), "task": bundle.get("task"),
@@ -421,8 +463,9 @@ def run_chunked(args):
                 "actual_fps": bundle.get("actual_fps"), "stride": bundle.get("stride"),
                 "chunk_index": bundle["chunk_index"], "num_chunks": bundle["num_chunks"],
                 "chunk_start": chunk_start, "chunk_end": chunk_end,
-                "max_frames": args.max_frames,
+                "grid_size": args.grid_size, "vo_points": args.vo_points, "max_frames": args.max_frames,
             })
+        free_fg(fg)
         if summary is None:
             n_skipped_empty += 1
         else:
@@ -431,20 +474,119 @@ def run_chunked(args):
     log(f"Done. {n_processed} chunk(s) lifted, {n_skipped_empty} skipped (no instances in window).")
 
 
+def run_bulk(args):
+    """Manifest-driven bulk mode: for every manifest row [start, end),
+    redownloads+resamples the segment fresh into --tmp-dir, lifts every
+    chunk stage1a.py/stage1b.py already wrote under
+    <save-root>/<segment_id>/<chunk_idx:05d>/bundle.json, then deletes the
+    downloaded/resampled clip. A row with no chunk directories yet (stage 1
+    hasn't reached it) is skipped with a log line, not an error -- this is
+    what makes running stage 2 over a wider --start:--end than stage 1 has
+    covered safe.
+    """
+    rows = load_manifest_range(args.manifest, args.start, args.end)
+    log(f"Loaded {len(rows)} manifest row(s) in [{args.start}, {args.end})")
+    os.makedirs(args.save_root, exist_ok=True)
+    os.makedirs(args.tmp_dir, exist_ok=True)
+
+    vggt4track_model, model = load_models(args.track_mode, args.vo_points)
+
+    n_processed, n_skipped_no_stage1, n_skipped_done, n_skipped_empty = 0, 0, 0, 0
+    for row in rows:
+        seg_id = row["segment_id"]
+        seg_dir = os.path.join(args.save_root, seg_id)
+        chunk_dirs = sorted(glob.glob(os.path.join(seg_dir, "[0-9]" * 5)))
+        if not chunk_dirs:
+            log(f"[{seg_id}] SKIP: no chunk directories under {seg_dir} (stage 1 not yet run)")
+            n_skipped_no_stage1 += 1
+            continue
+
+        seg_path = os.path.join(args.tmp_dir, f"{seg_id}_raw.mp4")
+        resampled_path = os.path.join(args.tmp_dir, f"{seg_id}_resampled.mp4")
+        vr = None
+        try:
+            for chunk_dir in chunk_dirs:
+                bundle_path = os.path.join(chunk_dir, "bundle.json")
+                with open(bundle_path) as f:
+                    bundle = json.load(f)
+
+                if args.check_existing and glob.glob(os.path.join(chunk_dir, "*_trace_summary.json")):
+                    log(f"[{seg_id}] chunk {bundle['chunk_index']:05d}: trace_summary.json exists, skipping")
+                    n_skipped_done += 1
+                    continue
+                if not bundle["instances"]:
+                    log(f"[{seg_id}] chunk {bundle['chunk_index']:05d}: zero instances in bundle, skipping")
+                    n_skipped_empty += 1
+                    continue
+
+                if vr is None:
+                    log(f"[{seg_id}] downloading segment...")
+                    download_segment(bundle["bucket"], bundle["key"], bundle["start_sec"], bundle["duration_sec"],
+                                      seg_path)
+                    resample_video(seg_path, resampled_path, bundle["target_fps"], verbose=args.verbose)
+                    decord.bridge.set_bridge("native")
+                    vr = decord.VideoReader(resampled_path)
+
+                chunk_start, chunk_end = bundle["chunk_start"], bundle["chunk_end"]
+                native_h, native_w = bundle["resolution_hw"]
+                clip_stem = bundle.get("segment_id", seg_id)
+                log(f"=== [{seg_id}] chunk {bundle['chunk_index']:05d}/{bundle['num_chunks'] - 1} "
+                    f"[{chunk_start},{chunk_end}) ===")
+
+                local_instances = []
+                for inst in bundle["instances"]:
+                    local = dict(inst)
+                    local["seed_frame"] = inst["seed_frame"] - chunk_start
+                    local["first_frame"] = inst["first_frame"] - chunk_start
+                    local["last_frame"] = inst["last_frame"] - chunk_start
+                    local_instances.append(local)
+
+                fg = run_frontend_and_grid(vr, chunk_start, chunk_end, native_h, native_w, vggt4track_model, model,
+                                            args.target_size, args.grid_size, args.vo_points)
+                summary = run_entity_call_and_save(
+                    fg, local_instances, chunk_dir, clip_stem, model, native_h, native_w, args.target_size,
+                    summary_extra={
+                        "video": bundle["video"], "source_video": bundle.get("source_video"),
+                        "narration": bundle.get("narration"), "task": bundle.get("task"),
+                        "native_fps": bundle.get("native_fps"), "target_fps": bundle.get("target_fps"),
+                        "actual_fps": bundle.get("actual_fps"), "stride": bundle.get("stride"),
+                        "chunk_index": bundle["chunk_index"], "num_chunks": bundle["num_chunks"],
+                        "chunk_start": chunk_start, "chunk_end": chunk_end,
+                        "grid_size": args.grid_size, "vo_points": args.vo_points, "max_frames": args.max_frames,
+                    })
+                free_fg(fg)
+                if summary is None:
+                    n_skipped_empty += 1
+                else:
+                    n_processed += 1
+        except Exception as e:
+            log(f"[{seg_id}] FAILED: {e}")
+        finally:
+            del vr
+            cleanup(seg_path, resampled_path)
+
+    log(f"Bulk run done. {n_processed} chunk(s) lifted, {n_skipped_no_stage1} segment(s) skipped (no stage 1), "
+        f"{n_skipped_done} chunk(s) skipped (already done), {n_skipped_empty} chunk(s) skipped (no instances).")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bundle", help="stage1_detect.py output JSON (single-clip mode)")
+    ap.add_argument("--bundle", help="bundle JSON (single-clip mode)")
     ap.add_argument("--out-dir", help="single-clip mode only")
-    ap.add_argument("--save-root", help="chunked bulk-annotation mode: processes every chunk under "
-                     "<save-root>/<video_stem>/<chunk_idx:05d>/bundle.json (as written by "
-                     "stage1_detect.py's --save-root mode). Requires --video to derive video_stem. "
-                     "Mutually exclusive with --bundle/--out-dir.")
-    ap.add_argument("--video", help="chunked mode only: original source video, used only to derive "
-                     "video_stem (matches stage1_detect.py's --video for the same run).")
+    ap.add_argument("--save-root", help="legacy chunked mode: processes every chunk under "
+                     "<save-root>/<video_stem>/<chunk_idx:05d>/bundle.json. Requires --video to derive "
+                     "video_stem. Bulk mode: output root for --manifest mode.")
+    ap.add_argument("--video", help="legacy chunked mode only: original source video, used only to derive "
+                     "video_stem for the same run.")
     ap.add_argument("--chunk-index", type=int, default=None,
-                     help="chunked mode only: process just this one chunk index instead of every "
-                          "chunk under video_stem/ (e.g. to re-run a single chunk with --save-scene "
-                          "for a spot-check without redoing/re-saving the rest).")
+                     help="legacy chunked mode only: process just this one chunk index instead of every "
+                          "chunk under video_stem/.")
+    ap.add_argument("--manifest", help="bulk mode: JSONL manifest from build_manifest_ego4d.py, same file/"
+                     "index used by stage1a.py/stage1b.py. Mutually exclusive with --bundle/--video.")
+    ap.add_argument("--start", type=int, default=None, help="bulk mode: first manifest row index (inclusive)")
+    ap.add_argument("--end", type=int, default=None, help="bulk mode: last manifest row index (exclusive)")
+    ap.add_argument("--tmp-dir", default=os.path.expanduser("~/ego4d/scratch"),
+                     help="bulk mode: scratch directory for downloaded/resampled clips.")
     ap.add_argument("--grid-size", type=int, default=20,
                      help="background/VO grid density (query count = grid_size^2). Default matches the "
                           "measured A10G ceiling for 35 frames at target_size=1288 (22.17GB peak for a single "
@@ -456,21 +598,22 @@ def main():
     ap.add_argument("--max-frames", type=int, default=35,
                      help="frame-count ceiling for a single STv2 window (default: measured A10G ceiling)")
     ap.add_argument("--track-mode", default="offline")
-    ap.add_argument("--save-scene", action="store_true",
-                     help="also save <clip>_scene.npz (raw video + dense depth + camera params, "
-                          "~500MB for a 35-frame 728x1288 clip -- 99%%+ of this stage's disk footprint). "
-                          "Only needed if you plan to run stage3_render.py on this clip; the per-instance "
-                          "trajectory npz's (a few KB each) are saved regardless and are all that's needed "
-                          "for downstream trajectory use. Off by default.")
+    ap.add_argument("--check-existing", action="store_true", default=False,
+                     help="bulk mode: skip a chunk if its *_trace_summary.json already exists (resume mode). "
+                          "Default is to overwrite/re-run every chunk in range.")
+    ap.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     args = ap.parse_args()
 
-    if bool(args.save_root) == bool(args.bundle or args.out_dir):
-        raise SystemExit("Pass exactly one of --bundle/--out-dir (single-clip mode) or "
-                          "--save-root/--video (chunked mode).")
+    modes = [bool(args.manifest), bool(args.bundle or args.out_dir), bool(args.save_root and args.video)]
+    if sum(modes) != 1:
+        raise SystemExit("Pass exactly one of --manifest+--start+--end (bulk mode), --bundle/--out-dir "
+                          "(single-clip mode), or --save-root+--video (legacy chunked mode).")
 
-    if args.save_root:
-        if not args.video:
-            raise SystemExit("--save-root mode requires --video (to derive video_stem).")
+    if args.manifest:
+        if args.start is None or args.end is None or not args.save_root:
+            raise SystemExit("Bulk mode (--manifest) requires --start, --end, and --save-root.")
+        run_bulk(args)
+    elif args.save_root:
         run_chunked(args)
     else:
         run_single(args)

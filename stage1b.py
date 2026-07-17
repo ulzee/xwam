@@ -1,0 +1,220 @@
+"""Stage 1b (runs in the `qwen_sam2` conda env): GroundingDINO+SAM2 tracking
+only -- reads stage1a.py's identify.json (task/objects + the exact download
+recipe it used), redownloads the same segment, resamples it, tracks
+hands+every named object across the clip in consecutive max-frames windows
+("chunks"), and writes one bundle.json per chunk. Manifest-driven bulk mode
+only; for every row in [--start, --end) with an identify.json already
+present, deletes the segment again once done.
+
+Split out of a single interleaved stage1_detect.py into its own process
+specifically so GroundingDINO+SAM2 only ever has to load ONCE for a whole
+--start:--end range, without fighting Qwen3-VL (stage1a.py) for VRAM on a
+23GB card -- see stage1a.py's docstring.
+"""
+import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+import argparse
+import json
+import time
+
+from entity_tracker import track_prompted_entities_chunks, load_gdino, load_sam2_predictor
+from fps_sample import farthest_point_sample
+from frame_sampling import resample_video, compute_chunk_starts
+from dataset_io import download_segment, load_manifest_range, cleanup
+
+
+def run_track(video_path, save_root, segment_id, narration, task, objects, resampled_path, download_recipe,
+              point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
+              stale_frames=10, box_threshold=0.3, text_threshold=0.25, max_concurrent_per_label=4,
+              point_margin=3, verbose=True):
+    """Resamples video_path once, tiles it into consecutive max_frames
+    windows ("chunks") from frame 0 to the end of the clip, tracks every
+    chunk, writes one bundle.json per chunk to
+    save_root/<segment_id>/<chunk_idx:%05d>/bundle.json. A chunk with zero
+    detected instances still gets a bundle.json (empty "instances": []) so
+    stage2_lift3d.py can enumerate and skip it explicitly rather than
+    silently missing a chunk index. `download_recipe`
+    ({bucket, key, start_sec, duration_sec}) is embedded in every chunk's
+    bundle.json so stage2/stage3 can replay the identical S3 trim without
+    needing the manifest again. Assumes GroundingDINO+SAM2 are already
+    loaded (caller's responsibility, so a bulk caller loads them once for a
+    whole range instead of once per row).
+    """
+    objects = objects or []
+    t0 = time.time()
+    def elapsed():
+        return time.time() - t0
+
+    video_out_dir = os.path.join(save_root, segment_id)
+    os.makedirs(video_out_dir, exist_ok=True)
+
+    print(f"[{elapsed():7.1f}s] Resampling video...")
+    rs_meta = resample_video(video_path, resampled_path, target_fps, verbose=verbose)
+    stride = rs_meta["stride"]
+    n_frames_resampled = rs_meta["n_frames_resampled"]
+    print(f"[{elapsed():7.1f}s] Resample done.")
+
+    prompt_specs = [("hand", "hand", "a hand.")]
+    prompt_specs += [(obj, "object", f"{obj}.") for obj in objects]
+
+    if check_interval is None:
+        check_interval = max(1, max_frames // num_checks)
+
+    chunk_starts = compute_chunk_starts(n_frames_resampled, 0, max_frames)
+    if verbose:
+        print(f"{len(chunk_starts)} chunk(s) of up to {max_frames} frames each "
+              f"(check_interval={check_interval})...")
+    if not chunk_starts:
+        raise RuntimeError(f"No chunks to process: resampled clip has only {n_frames_resampled} frame(s).")
+
+    print(f"[{elapsed():7.1f}s] Starting GDINO+SAM2 chunk tracking ({len(chunk_starts)} chunk(s))...")
+    result = track_prompted_entities_chunks(
+        resampled_path, prompt_specs, chunk_starts, max_frames,
+        check_interval=check_interval, stale_frames=stale_frames,
+        box_threshold=box_threshold, text_threshold=text_threshold,
+        max_concurrent_per_label=max_concurrent_per_label, verbose=verbose,
+    )
+    print(f"[{elapsed():7.1f}s] Chunk tracking done.")
+    native_h, native_w = result["frame_size"]
+
+    bundle_paths = []
+    for chunk_idx, chunk in enumerate(result["chunks"]):
+        chunk_start, chunk_end, meta = chunk["chunk_start"], chunk["chunk_end"], chunk["meta"]
+        instances = []
+        for obj_id, info in meta.items():
+            if info["seed_mask"] is None:
+                if verbose:
+                    print(f"  chunk {chunk_idx}: skipping obj {obj_id} ({info['label']}): never produced a usable mask")
+                continue
+            seed_frame = min(f for f, v in info["visible"].items() if v)
+            pts = farthest_point_sample(info["seed_mask"], point_budget, margin=point_margin)
+            n_visible = sum(1 for v in info["visible"].values() if v)
+            instances.append({
+                "instance_id": f"{info['label']}_{obj_id}",
+                "obj_id": obj_id,
+                "label": info["label"],
+                "category": info["category"],
+                "first_frame": info["first_frame"],
+                "last_frame": info["last_frame"],
+                "seed_frame": seed_frame,
+                "num_visible_frames": n_visible,
+                "gdino_score": info["gdino_score"],
+                "query_points_px": pts.tolist(),
+            })
+
+        chunk_dir = os.path.join(video_out_dir, f"{chunk_idx:05d}")
+        os.makedirs(chunk_dir, exist_ok=True)
+        bundle = {
+            "segment_id": segment_id,
+            "source_video": os.path.abspath(video_path),
+            "video": resampled_path,
+            "narration": narration,
+            "task": task,
+            "objects_identified": objects,
+            "native_fps": rs_meta["native_fps"],
+            "target_fps": target_fps,
+            "actual_fps": rs_meta["actual_fps"],
+            "stride": stride,
+            "num_frames_native": rs_meta["native_n_frames"],
+            "num_frames_resampled": n_frames_resampled,
+            "chunk_index": chunk_idx,
+            "num_chunks": len(result["chunks"]),
+            "chunk_start": chunk_start,
+            "chunk_end": chunk_end,
+            "check_interval": check_interval,
+            "resolution_hw": [native_h, native_w],
+            "point_budget": point_budget,
+            "instances": instances,
+            **download_recipe,
+        }
+        bundle_path = os.path.join(chunk_dir, "bundle.json")
+        with open(bundle_path, "w") as f:
+            json.dump(bundle, f, indent=2)
+        bundle_paths.append(bundle_path)
+        if verbose:
+            print(f"  chunk {chunk_idx:05d} [{chunk_start},{chunk_end}): {len(instances)} instance(s) -> {bundle_path}")
+
+    print(f"[{elapsed():7.1f}s] Done. {len(bundle_paths)} bundle(s) written.")
+    return bundle_paths
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True, help="JSONL manifest from build_manifest_ego4d.py, "
+                     "same file/index used by stage1a.py")
+    ap.add_argument("--start", type=int, required=True, help="first manifest row index (inclusive)")
+    ap.add_argument("--end", type=int, required=True, help="last manifest row index (exclusive)")
+    ap.add_argument("--save-root", required=True)
+    ap.add_argument("--tmp-dir", default=os.path.expanduser("~/ego4d/scratch"),
+                     help="scratch directory for downloaded/resampled clips.")
+    ap.add_argument("--point-budget", type=int, default=10)
+    ap.add_argument("--max-frames", type=int, default=35,
+                     help="cap detection to the first N frames of each window, matching stage 2's "
+                          "SpatialTrackerV2 window ceiling.")
+    ap.add_argument("--num-checks", type=int, default=3,
+                     help="number of periodic re-detection passes within the max-frames window; "
+                          "check_interval is derived as max_frames // num_checks unless --check-interval "
+                          "is given explicitly.")
+    ap.add_argument("--check-interval", type=int, default=None,
+                     help="explicit frame interval between re-detection passes, overriding the "
+                          "--num-checks-derived default.")
+    ap.add_argument("--target-fps", type=float, default=10,
+                     help="resample to this fps before chunking. Must match stage1a.py's --duration-sec "
+                          "sizing assumption if you change it.")
+    ap.add_argument("--stale-frames", type=int, default=10)
+    ap.add_argument("--box-threshold", type=float, default=0.3)
+    ap.add_argument("--text-threshold", type=float, default=0.25)
+    ap.add_argument("--max-concurrent-per-label", type=int, default=4)
+    ap.add_argument("--point-margin", type=int, default=3,
+                     help="erode each instance's seed mask inward by this many pixels before sampling query "
+                          "points, so points land away from the mask boundary. 0 disables this.")
+    ap.add_argument("--check-existing", action="store_true", default=False,
+                     help="skip a row if its chunk-0 bundle.json already exists (resume mode). Default is to "
+                          "overwrite/re-run every row in range.")
+    ap.add_argument("--quiet", dest="verbose", action="store_false", default=True)
+    args = ap.parse_args()
+
+    rows = load_manifest_range(args.manifest, args.start, args.end)
+    print(f"Loaded {len(rows)} manifest row(s) in [{args.start}, {args.end})")
+    os.makedirs(args.save_root, exist_ok=True)
+    os.makedirs(args.tmp_dir, exist_ok=True)
+
+    load_gdino()
+    load_sam2_predictor()
+    for row in rows:
+        seg_id = row["segment_id"]
+        out_dir = os.path.join(args.save_root, seg_id)
+        identify_path = os.path.join(out_dir, "identify.json")
+        bundle0_path = os.path.join(out_dir, "00000", "bundle.json")
+        if args.check_existing and os.path.exists(bundle0_path):
+            print(f"[{seg_id}] bundle.json exists, skipping")
+            continue
+        if not os.path.exists(identify_path):
+            print(f"[{seg_id}] SKIP: no identify.json (run stage1a.py first)")
+            continue
+        with open(identify_path) as f:
+            ident = json.load(f)
+        seg_path = os.path.join(args.tmp_dir, f"{seg_id}_raw.mp4")
+        resampled_path = os.path.join(args.tmp_dir, f"{seg_id}_resampled.mp4")
+        try:
+            download_segment(ident["bucket"], ident["key"], ident["start_sec"], ident["duration_sec"], seg_path)
+            run_track(
+                seg_path, args.save_root, seg_id, ident["narration_text"], ident["task"], ident["objects"],
+                resampled_path,
+                download_recipe={"bucket": ident["bucket"], "key": ident["key"],
+                                  "start_sec": ident["start_sec"], "duration_sec": ident["duration_sec"]},
+                point_budget=args.point_budget, check_interval=args.check_interval,
+                num_checks=args.num_checks, max_frames=args.max_frames, target_fps=args.target_fps,
+                stale_frames=args.stale_frames, box_threshold=args.box_threshold,
+                text_threshold=args.text_threshold, max_concurrent_per_label=args.max_concurrent_per_label,
+                point_margin=args.point_margin, verbose=args.verbose)
+        except Exception as e:
+            print(f"[{seg_id}] FAILED: {e}")
+        finally:
+            cleanup(seg_path, resampled_path)
+
+    print("Stage 1b done.")
+
+
+if __name__ == "__main__":
+    main()

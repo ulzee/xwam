@@ -1,4 +1,4 @@
-"""Frame-rate resampling + chunk-window math shared by stage1_detect.py and
+"""Frame-rate resampling + chunk-window math shared by stage1b.py and
 stage2_lift3d.py's chunked ("bulk annotation") run mode.
 
 The resampling happens ONCE per source video, up front: a video's native fps

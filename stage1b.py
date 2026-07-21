@@ -1,10 +1,11 @@
 """Stage 1b (runs in the `qwen_sam2` conda env): GroundingDINO+SAM2 tracking
-only -- reads stage1a.py's identify.json (task/objects + the exact download
-recipe it used), redownloads the same segment, resamples it, tracks
-hands+every named object across the clip in consecutive max-frames windows
-("chunks"), and writes one bundle.json per chunk (instances + a
-complementary "background" query-point field, see run_track's docstring).
-Manifest-driven bulk mode only; for every row in [--start, --end) with an
+only -- reads stage1a.py's identify.json (task/objects/background + the
+exact download recipe it used), redownloads the same segment, resamples it,
+tracks hands+every named "objects" item AND every named "background" item
+across the clip in consecutive max-frames windows ("chunks"), and writes one
+bundle.json per chunk: "instances" (hand + "objects") and "background" (the
+identify.json "background" list), each segmented the same way. Manifest-
+driven bulk mode only; for every row in [--start, --end) with an
 identify.json already present, deletes the segment again once done.
 
 Split out of a single interleaved stage1_detect.py into its own process
@@ -17,8 +18,9 @@ downloaded to --tmp-dir, used to produce this row's bundle.json(s), then
 deleted in main()'s `finally` -- nothing durable ever holds onto the actual
 video. --visualize is an opt-in escape hatch for eyeballing segmentation
 quality without keeping the source video around: it saves one small JPG per
-tracked instance (its seed frame with the seed mask + query points overlaid)
-under save-root/<segment_id>/viz/, which -- unlike the video -- IS kept.
+detected item (its seed frame with its mask + query points overlaid) under
+save-root/<segment_id>/viz/objects/ or .../viz/background/, which -- unlike
+the video -- IS kept. See run_track's docstring for the full breakdown.
 """
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -61,10 +63,10 @@ def draw_seed_visualization(frame_rgb, mask, points_px, label, color):
     return img_bgr
 
 
-def run_track(video_path, save_root, segment_id, narration, task, objects, resampled_path, download_recipe,
-              point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
+def run_track(video_path, save_root, segment_id, narration, task, objects, background_objects, resampled_path,
+              download_recipe, point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
               stale_frames=10, box_threshold=0.3, text_threshold=0.25, max_concurrent_per_label=4,
-              point_margin=3, background_point_budget=20, visualize=False, verbose=True):
+              point_margin=3, background_point_budget=None, visualize=False, verbose=True):
     """Resamples video_path once, tiles it into consecutive max_frames
     windows ("chunks") from frame 0 to the end of the clip, tracks every
     chunk, writes one bundle.json per chunk to
@@ -78,32 +80,33 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
     loaded (caller's responsibility, so a bulk caller loads them once for a
     whole range instead of once per row).
 
-    Each chunk's bundle also gets a top-level "background" field alongside
-    "instances": one entry per instance, each carrying query points sampled
-    from the complement of the union of every instance mask that shares
-    THAT instance's own seed_frame (not the whole chunk's instances lumped
-    onto one arbitrary frame -- instances are seeded at different times, so
-    a single merged mask would exclude a frame-33 object's footprint from a
-    frame-0 background image it was never actually in, and vice versa).
-    Instances sharing a seed_frame therefore get byte-identical background
-    entries (computed once per distinct frame, reused). Approximate rather
-    than pixel-exact -- e.g. an instance visible at that frame but never
-    itself seeded there isn't excluded -- which is fine for its purpose:
-    these points are for an image+action -> trajectory model that is always
-    given the source frame back alongside them, so a few mis-included/
-    excluded edge pixels don't matter the way an instance mask's own
-    accuracy does.
+    `background_objects` (identify.json's "background" list -- untouched
+    scenery like "coffee table", "remote control") is detected+tracked the
+    same way as `objects`, through the same GDINO+SAM2 pass, and written to
+    the chunk's bundle.json as a "background" list parallel to "instances"
+    (same per-entry shape: instance_id/label/category/.../query_points_px).
+    Where a background item's mask overlaps a same-frame hand/object
+    instance's mask, the overlap is subtracted from the background item's
+    mask before query points are sampled -- "objects" (and hands) always
+    win a collision, since those are the ones actually being manipulated.
+    If a background item's mask is fully consumed by that subtraction, it's
+    dropped for that chunk (logged, not an error) exactly like an instance
+    that never produced a usable mask.
 
-    visualize: if True, also writes, per instance:
+    visualize: if True, also writes, per detected item:
       save_root/<segment_id>/viz/objects/<chunk_idx>_<instance_id>.jpg
-        -- the instance's own seed frame with its seed mask + query points.
-      save_root/<segment_id>/viz/background/<chunk_idx>_<instance_id>_background.jpg
-        -- that SAME frame with its paired background mask + query points.
+        -- for hand/object instances: seed frame + seed mask + query points.
+      save_root/<segment_id>/viz/background/<chunk_idx>_<instance_id>.jpg
+        -- for background items: seed frame + (collision-resolved) mask +
+        query points.
     Reads frames from resampled_path (still on disk at this point, before
     the caller's cleanup), so it doesn't need the raw video kept around any
     longer than usual.
     """
     objects = objects or []
+    background_objects = background_objects or []
+    if background_point_budget is None:
+        background_point_budget = point_budget
     t0 = time.time()
     def elapsed():
         return time.time() - t0
@@ -129,6 +132,7 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
 
     prompt_specs = [("hand", "hand", "a hand.")]
     prompt_specs += [(obj, "object", f"{obj}.") for obj in objects]
+    prompt_specs += [(obj, "background", f"{obj}.") for obj in background_objects]
 
     if check_interval is None:
         check_interval = max(1, max_frames // num_checks)
@@ -153,65 +157,68 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
     bundle_paths = []
     for chunk_idx, chunk in enumerate(result["chunks"]):
         chunk_start, chunk_end, meta = chunk["chunk_start"], chunk["chunk_end"], chunk["meta"]
-        instances = []
-        occupied_by_frame = {}  # seed_frame -> union of every instance mask seeded at that exact frame
+
+        # Pass 1: resolve every detected item's seed_frame/instance_id and
+        # build the per-frame union of hand/object masks, so pass 2 can
+        # subtract same-frame foreground from any colliding background mask.
+        resolved = []
+        foreground_by_frame = {}
         for obj_id, info in meta.items():
             if info["seed_mask"] is None:
                 if verbose:
                     print(f"  chunk {chunk_idx}: skipping obj {obj_id} ({info['label']}): never produced a usable mask")
                 continue
             seed_frame = min(f for f, v in info["visible"].items() if v)
-            if seed_frame not in occupied_by_frame:
-                occupied_by_frame[seed_frame] = np.zeros((native_h, native_w), dtype=bool)
-            occupied_by_frame[seed_frame] |= info["seed_mask"]
-            pts = farthest_point_sample(info["seed_mask"], point_budget, margin=point_margin)
+            resolved.append({
+                "obj_id": obj_id, "info": info, "seed_frame": seed_frame,
+                "instance_id": f"{info['label']}_{obj_id}",
+            })
+            if info["category"] in ("hand", "object"):
+                if seed_frame not in foreground_by_frame:
+                    foreground_by_frame[seed_frame] = np.zeros((native_h, native_w), dtype=bool)
+                foreground_by_frame[seed_frame] |= info["seed_mask"]
+
+        # Pass 2: build "instances" (hand/object, mask as-is) and
+        # "background" (collision-resolved against same-frame foreground).
+        instances, background = [], []
+        for r in resolved:
+            obj_id, info, seed_frame, instance_id = r["obj_id"], r["info"], r["seed_frame"], r["instance_id"]
+            category = info["category"]
+            mask = info["seed_mask"]
+            if category == "background":
+                fg_mask = foreground_by_frame.get(seed_frame)
+                if fg_mask is not None:
+                    mask = mask & ~fg_mask
+                if not mask.any():
+                    if verbose:
+                        print(f"  chunk {chunk_idx}: dropping background obj {obj_id} ({info['label']}): "
+                              f"fully overlapped by a same-frame object/hand mask")
+                    continue
+            budget = background_point_budget if category == "background" else point_budget
+            pts = farthest_point_sample(mask, budget, margin=point_margin)
             n_visible = sum(1 for v in info["visible"].values() if v)
-            instance_id = f"{info['label']}_{obj_id}"
-            if visualize:
-                frame = viz_vr[seed_frame].asnumpy()
-                color = INSTANCE_COLORS[obj_id % len(INSTANCE_COLORS)]
-                img = draw_seed_visualization(frame, info["seed_mask"], pts, instance_id, color)
-                viz_path = os.path.join(obj_viz_dir, f"{chunk_idx:05d}_{instance_id}.jpg")
-                cv2.imwrite(viz_path, img)
-                if verbose:
-                    print(f"  chunk {chunk_idx}: wrote {viz_path}")
-            instances.append({
+            record = {
                 "instance_id": instance_id,
                 "obj_id": obj_id,
                 "label": info["label"],
-                "category": info["category"],
+                "category": category,
                 "first_frame": info["first_frame"],
                 "last_frame": info["last_frame"],
                 "seed_frame": seed_frame,
                 "num_visible_frames": n_visible,
                 "gdino_score": info["gdino_score"],
                 "query_points_px": pts.tolist(),
-            })
-
-        # Background is computed once per DISTINCT seed_frame (not once per
-        # instance, and never merged across frames -- see run_track's
-        # docstring), then attached to every instance that shares that frame.
-        bg_by_frame = {}
-        for seed_frame, occupied in occupied_by_frame.items():
-            bg_mask = ~occupied
-            bg_pts = farthest_point_sample(bg_mask, background_point_budget, margin=point_margin)
-            bg_by_frame[seed_frame] = (bg_mask, bg_pts)
-
-        background = []
-        for inst in instances:
-            seed_frame, instance_id = inst["seed_frame"], inst["instance_id"]
-            bg_mask, bg_pts = bg_by_frame[seed_frame]
-            background.append({
-                "instance_id": instance_id, "seed_frame": seed_frame,
-                "query_points_px": bg_pts.tolist(),
-            })
+            }
             if visualize:
                 frame = viz_vr[seed_frame].asnumpy()
-                img = draw_seed_visualization(frame, bg_mask, bg_pts, f"{instance_id}_background", (180, 180, 180))
-                viz_path = os.path.join(bg_viz_dir, f"{chunk_idx:05d}_{instance_id}_background.jpg")
+                is_bg = category == "background"
+                color = (180, 180, 180) if is_bg else INSTANCE_COLORS[obj_id % len(INSTANCE_COLORS)]
+                img = draw_seed_visualization(frame, mask, pts, instance_id, color)
+                viz_path = os.path.join(bg_viz_dir if is_bg else obj_viz_dir, f"{chunk_idx:05d}_{instance_id}.jpg")
                 cv2.imwrite(viz_path, img)
                 if verbose:
                     print(f"  chunk {chunk_idx}: wrote {viz_path}")
+            (background if category == "background" else instances).append(record)
 
         chunk_dir = os.path.join(video_out_dir, f"{chunk_idx:05d}")
         os.makedirs(chunk_dir, exist_ok=True)
@@ -222,6 +229,7 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
             "narration": narration,
             "task": task,
             "objects_identified": objects,
+            "background_identified": background_objects,
             "native_fps": rs_meta["native_fps"],
             "target_fps": target_fps,
             "actual_fps": rs_meta["actual_fps"],
@@ -245,7 +253,8 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
             json.dump(bundle, f, indent=2)
         bundle_paths.append(bundle_path)
         if verbose:
-            print(f"  chunk {chunk_idx:05d} [{chunk_start},{chunk_end}): {len(instances)} instance(s) -> {bundle_path}")
+            print(f"  chunk {chunk_idx:05d} [{chunk_start},{chunk_end}): {len(instances)} instance(s), "
+                  f"{len(background)} background item(s) -> {bundle_path}")
 
     print(f"[{elapsed():7.1f}s] Done. {len(bundle_paths)} bundle(s) written.")
     return bundle_paths
@@ -261,11 +270,10 @@ def main():
     ap.add_argument("--tmp-dir", default=os.path.expanduser("~/ego4d/scratch"),
                      help="scratch directory for downloaded/resampled clips.")
     ap.add_argument("--point-budget", type=int, default=10)
-    ap.add_argument("--background-point-budget", type=int, default=20,
-                     help="query points sampled from the complement of the union of all instance seed masks "
-                          "in a chunk (everywhere that isn't a tracked hand/object), written to the chunk's "
-                          "bundle.json under \"background\". Defaults higher than --point-budget since the "
-                          "background region is typically much larger than any one instance's mask.")
+    ap.add_argument("--background-point-budget", type=int, default=None,
+                     help="query points per background item (identify.json's \"background\" list -- detected/"
+                          "segmented the same way as --point-budget's \"objects\", written to the chunk's "
+                          "bundle.json under \"background\"). Defaults to --point-budget's value if unset.")
     ap.add_argument("--max-frames", type=int, default=35,
                      help="cap detection to the first N frames of each window, matching stage 2's "
                           "SpatialTrackerV2 window ceiling.")
@@ -290,10 +298,11 @@ def main():
                      help="skip a row if its chunk-0 bundle.json already exists (resume mode). Default is to "
                           "overwrite/re-run every row in range.")
     ap.add_argument("--visualize", action="store_true", default=False,
-                     help="for each tracked instance, save a JPG of its seed frame with the seed mask and "
-                          "query points overlaid, under save-root/<segment_id>/viz/. Off by default since it "
-                          "adds per-instance disk writes; the raw/resampled video itself is always deleted "
-                          "after each row regardless of this flag.")
+                     help="for each tracked instance/background item, save a JPG of its seed frame with its "
+                          "mask and query points overlaid, under save-root/<segment_id>/viz/objects/ and "
+                          ".../viz/background/ respectively. Off by default since it adds per-item disk "
+                          "writes; the raw/resampled video itself is always deleted after each row regardless "
+                          "of this flag.")
     ap.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     args = ap.parse_args()
 
@@ -323,7 +332,7 @@ def main():
             download_segment(ident["bucket"], ident["key"], ident["start_sec"], ident["duration_sec"], seg_path)
             run_track(
                 seg_path, args.save_root, seg_id, ident["narration_text"], ident["task"], ident["objects"],
-                resampled_path,
+                ident.get("background", []), resampled_path,
                 download_recipe={"bucket": ident["bucket"], "key": ident["key"],
                                   "start_sec": ident["start_sec"], "duration_sec": ident["duration_sec"]},
                 point_budget=args.point_budget, check_interval=args.check_interval,

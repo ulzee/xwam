@@ -162,6 +162,22 @@ def _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_ar
     describes, with obj_ids local to THIS window starting at 1 (windows are
     treated as independent instance sets -- no identity is carried across
     a window boundary, by design: each chunk gets its own trajectory).
+
+    A "background"-category candidate box that overlaps an already-active
+    "hand"/"object" box is rejected before being seeded (see the `category
+    == "background"` branch below). Each label's own text_prompt is run
+    through GroundingDINO independently, with no semantic awareness of any
+    OTHER label -- so a loosely-matching background prompt (e.g. "circular
+    coaster") can and does land its detection on a completely different,
+    already-tracked foreground object's region (e.g. "toy box") purely by
+    box geometry, wasting a SAM2 track on a near-duplicate. Rejecting at
+    seed time (rather than only after the fact, via the mask-subtraction
+    stage1b.py does at collision time) means duplicates like this cost zero
+    SAM2 track slots and produce no near-empty leftover-sliver masks.
+    Requires hand/object prompts to appear before background prompts in
+    `prompt_specs` (stage1b.py's construction order) so this checkpoint's
+    own foreground detections are already in `active` by the time
+    background prompts run.
     """
     active = {}   # obj_id -> {"label", "empty_streak", "last_box"}
     meta = {}     # obj_id -> instance record (see track_prompted_entities docstring)
@@ -183,6 +199,10 @@ def _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_ar
             dets = detect_boxes(frame, text_prompt, box_threshold, text_threshold)
             dets = filter_detections(dets, frame_area, area_frac_max=area_frac_max)
             active_of_label = {oid: info for oid, info in active.items() if info["label"] == label}
+            foreground_boxes = (
+                [info["last_box"] for oid, info in active.items() if meta[oid]["category"] in ("hand", "object")]
+                if category == "background" else []
+            )
 
             for box, score in dets:
                 matched = any(
@@ -191,6 +211,11 @@ def _track_window(predictor, state, vr, prompt_specs, frame_h, frame_w, frame_ar
                     for info in active_of_label.values()
                 )
                 if matched:
+                    continue
+                if any(box_iou(box, fb) > 0.5 or box_containment(box, fb) > 0.85 for fb in foreground_boxes):
+                    if verbose:
+                        print(f"  [frame {checkpoint}] rejecting background '{label}' detection "
+                              f"(score={score:.2f}): overlaps an active object/hand box")
                     continue
                 if len(active_of_label) >= max_concurrent_per_label:
                     if verbose:

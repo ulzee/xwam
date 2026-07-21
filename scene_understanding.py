@@ -131,8 +131,14 @@ EXCLUDED_KEYWORDS = ["water", "steam", "smoke", "fluid", "splash", "vapor", "han
 
 
 def is_excluded(name):
-    lname = name.lower()
-    return any(kw in lname for kw in EXCLUDED_KEYWORDS)
+    # Match only the LAST word ("head noun"), not any substring -- "water" alone
+    # or "running water" should be excluded (the word "water" is what the name
+    # is fundamentally about), but "water bottle" or "hand towel" should not
+    # (the excluded word is just a modifier on a real, distinct physical
+    # object). Naive substring matching previously dropped legitimate items
+    # like "water bottle" from the background list.
+    words = re.findall(r"[a-z]+", name.lower())
+    return bool(words) and words[-1] in EXCLUDED_KEYWORDS
 
 
 def identify(video_path, narration=DEFAULT_NARRATION, fps=2.0, max_pixels=360 * 640, max_new_tokens=768):

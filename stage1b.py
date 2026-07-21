@@ -79,24 +79,29 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
     whole range instead of once per row).
 
     Each chunk's bundle also gets a top-level "background" field alongside
-    "instances": query points sampled from the complement of the union of
-    all of the chunk's instance seed masks (i.e. everywhere that isn't a
-    tracked hand/object), anchored at the chunk's own start frame. This is
-    a per-instance-mask union across masks captured at each instance's own
-    (possibly different) seed frame, not a single re-segmentation of one
-    frame -- approximate rather than pixel-exact, which is fine for its
-    purpose: these points are for an image+action -> trajectory model that
-    is always given the source frame back alongside them, so a few
-    mis-included/excluded edge pixels don't matter the way an instance
-    mask's own accuracy does.
+    "instances": one entry per instance, each carrying query points sampled
+    from the complement of the union of every instance mask that shares
+    THAT instance's own seed_frame (not the whole chunk's instances lumped
+    onto one arbitrary frame -- instances are seeded at different times, so
+    a single merged mask would exclude a frame-33 object's footprint from a
+    frame-0 background image it was never actually in, and vice versa).
+    Instances sharing a seed_frame therefore get byte-identical background
+    entries (computed once per distinct frame, reused). Approximate rather
+    than pixel-exact -- e.g. an instance visible at that frame but never
+    itself seeded there isn't excluded -- which is fine for its purpose:
+    these points are for an image+action -> trajectory model that is always
+    given the source frame back alongside them, so a few mis-included/
+    excluded edge pixels don't matter the way an instance mask's own
+    accuracy does.
 
-    visualize: if True, also writes save_root/<segment_id>/viz/<chunk_idx>_
-        <instance_id>.jpg -- each instance's seed frame with its seed mask
-        and sampled query points overlaid, purely for a quick visual sanity
-        check -- plus one <chunk_idx>_background.jpg the same way. Reads
-        frames from resampled_path (still on disk at this point, before the
-        caller's cleanup), so it doesn't need the raw video kept around any
-        longer than usual.
+    visualize: if True, also writes, per instance:
+      save_root/<segment_id>/viz/objects/<chunk_idx>_<instance_id>.jpg
+        -- the instance's own seed frame with its seed mask + query points.
+      save_root/<segment_id>/viz/background/<chunk_idx>_<instance_id>_background.jpg
+        -- that SAME frame with its paired background mask + query points.
+    Reads frames from resampled_path (still on disk at this point, before
+    the caller's cleanup), so it doesn't need the raw video kept around any
+    longer than usual.
     """
     objects = objects or []
     t0 = time.time()
@@ -105,10 +110,12 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
 
     video_out_dir = os.path.join(save_root, segment_id)
     os.makedirs(video_out_dir, exist_ok=True)
-    viz_dir, viz_vr = None, None
+    obj_viz_dir, bg_viz_dir, viz_vr = None, None, None
     if visualize:
-        viz_dir = os.path.join(video_out_dir, "viz")
-        os.makedirs(viz_dir, exist_ok=True)
+        obj_viz_dir = os.path.join(video_out_dir, "viz", "objects")
+        bg_viz_dir = os.path.join(video_out_dir, "viz", "background")
+        os.makedirs(obj_viz_dir, exist_ok=True)
+        os.makedirs(bg_viz_dir, exist_ok=True)
 
     print(f"[{elapsed():7.1f}s] Resampling video...")
     rs_meta = resample_video(video_path, resampled_path, target_fps, verbose=verbose)
@@ -147,14 +154,16 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
     for chunk_idx, chunk in enumerate(result["chunks"]):
         chunk_start, chunk_end, meta = chunk["chunk_start"], chunk["chunk_end"], chunk["meta"]
         instances = []
-        occupied = np.zeros((native_h, native_w), dtype=bool)
+        occupied_by_frame = {}  # seed_frame -> union of every instance mask seeded at that exact frame
         for obj_id, info in meta.items():
             if info["seed_mask"] is None:
                 if verbose:
                     print(f"  chunk {chunk_idx}: skipping obj {obj_id} ({info['label']}): never produced a usable mask")
                 continue
-            occupied |= info["seed_mask"]
             seed_frame = min(f for f, v in info["visible"].items() if v)
+            if seed_frame not in occupied_by_frame:
+                occupied_by_frame[seed_frame] = np.zeros((native_h, native_w), dtype=bool)
+            occupied_by_frame[seed_frame] |= info["seed_mask"]
             pts = farthest_point_sample(info["seed_mask"], point_budget, margin=point_margin)
             n_visible = sum(1 for v in info["visible"].values() if v)
             instance_id = f"{info['label']}_{obj_id}"
@@ -162,7 +171,7 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
                 frame = viz_vr[seed_frame].asnumpy()
                 color = INSTANCE_COLORS[obj_id % len(INSTANCE_COLORS)]
                 img = draw_seed_visualization(frame, info["seed_mask"], pts, instance_id, color)
-                viz_path = os.path.join(viz_dir, f"{chunk_idx:05d}_{instance_id}.jpg")
+                viz_path = os.path.join(obj_viz_dir, f"{chunk_idx:05d}_{instance_id}.jpg")
                 cv2.imwrite(viz_path, img)
                 if verbose:
                     print(f"  chunk {chunk_idx}: wrote {viz_path}")
@@ -179,16 +188,30 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
                 "query_points_px": pts.tolist(),
             })
 
-        background_mask = ~occupied
-        bg_pts = farthest_point_sample(background_mask, background_point_budget, margin=point_margin)
-        background = {"seed_frame": chunk_start, "query_points_px": bg_pts.tolist()}
-        if visualize:
-            frame = viz_vr[chunk_start].asnumpy()
-            img = draw_seed_visualization(frame, background_mask, bg_pts, "background", (180, 180, 180))
-            viz_path = os.path.join(viz_dir, f"{chunk_idx:05d}_background.jpg")
-            cv2.imwrite(viz_path, img)
-            if verbose:
-                print(f"  chunk {chunk_idx}: wrote {viz_path}")
+        # Background is computed once per DISTINCT seed_frame (not once per
+        # instance, and never merged across frames -- see run_track's
+        # docstring), then attached to every instance that shares that frame.
+        bg_by_frame = {}
+        for seed_frame, occupied in occupied_by_frame.items():
+            bg_mask = ~occupied
+            bg_pts = farthest_point_sample(bg_mask, background_point_budget, margin=point_margin)
+            bg_by_frame[seed_frame] = (bg_mask, bg_pts)
+
+        background = []
+        for inst in instances:
+            seed_frame, instance_id = inst["seed_frame"], inst["instance_id"]
+            bg_mask, bg_pts = bg_by_frame[seed_frame]
+            background.append({
+                "instance_id": instance_id, "seed_frame": seed_frame,
+                "query_points_px": bg_pts.tolist(),
+            })
+            if visualize:
+                frame = viz_vr[seed_frame].asnumpy()
+                img = draw_seed_visualization(frame, bg_mask, bg_pts, f"{instance_id}_background", (180, 180, 180))
+                viz_path = os.path.join(bg_viz_dir, f"{chunk_idx:05d}_{instance_id}_background.jpg")
+                cv2.imwrite(viz_path, img)
+                if verbose:
+                    print(f"  chunk {chunk_idx}: wrote {viz_path}")
 
         chunk_dir = os.path.join(video_out_dir, f"{chunk_idx:05d}")
         os.makedirs(chunk_dir, exist_ok=True)

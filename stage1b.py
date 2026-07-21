@@ -10,6 +10,14 @@ Split out of a single interleaved stage1_detect.py into its own process
 specifically so GroundingDINO+SAM2 only ever has to load ONCE for a whole
 --start:--end range, without fighting Qwen3-VL (stage1a.py) for VRAM on a
 23GB card -- see stage1a.py's docstring.
+
+Like stage1a.py, the raw (and resampled) video is only ever a scratch file:
+downloaded to --tmp-dir, used to produce this row's bundle.json(s), then
+deleted in main()'s `finally` -- nothing durable ever holds onto the actual
+video. --visualize is an opt-in escape hatch for eyeballing segmentation
+quality without keeping the source video around: it saves one small JPG per
+tracked instance (its seed frame with the seed mask + query points overlaid)
+under save-root/<segment_id>/viz/, which -- unlike the video -- IS kept.
 """
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -17,16 +25,45 @@ import argparse
 import json
 import time
 
+import cv2
+import decord
+import numpy as np
+
 from entity_tracker import track_prompted_entities_chunks, load_gdino, load_sam2_predictor
 from fps_sample import farthest_point_sample
 from frame_sampling import resample_video, compute_chunk_starts
 from dataset_io import download_segment, load_manifest_range, cleanup
 
+# Same palette as stage3_render.py's INSTANCE_COLORS, kept separate since the
+# two modules don't otherwise share any code.
+INSTANCE_COLORS = [
+    (230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
+    (145, 30, 180), (0, 200, 200), (240, 50, 230), (170, 110, 40), (128, 128, 0),
+]
+
+
+def draw_seed_visualization(frame_rgb, mask, points_px, label, color):
+    """Overlays a translucent `color` mask + query points on frame_rgb (HxWx3
+    uint8, RGB, as returned by decord). Returns a BGR uint8 image ready for
+    cv2.imwrite."""
+    img = frame_rgb.astype(np.float32)
+    overlay = np.zeros_like(img)
+    overlay[mask] = color
+    alpha = 0.45
+    blended = np.where(mask[..., None], img * (1 - alpha) + overlay * alpha, img)
+    img_bgr = cv2.cvtColor(blended.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    for x, y in points_px:
+        pt = (int(round(x)), int(round(y)))
+        cv2.circle(img_bgr, pt, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        cv2.circle(img_bgr, pt, 3, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+    cv2.putText(img_bgr, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return img_bgr
+
 
 def run_track(video_path, save_root, segment_id, narration, task, objects, resampled_path, download_recipe,
               point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
               stale_frames=10, box_threshold=0.3, text_threshold=0.25, max_concurrent_per_label=4,
-              point_margin=3, verbose=True):
+              point_margin=3, visualize=False, verbose=True):
     """Resamples video_path once, tiles it into consecutive max_frames
     windows ("chunks") from frame 0 to the end of the clip, tracks every
     chunk, writes one bundle.json per chunk to
@@ -39,6 +76,13 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
     needing the manifest again. Assumes GroundingDINO+SAM2 are already
     loaded (caller's responsibility, so a bulk caller loads them once for a
     whole range instead of once per row).
+
+    visualize: if True, also writes save_root/<segment_id>/viz/<chunk_idx>_
+        <instance_id>.jpg -- each instance's seed frame with its seed mask
+        and sampled query points overlaid, purely for a quick visual sanity
+        check. Reads frames from resampled_path (still on disk at this
+        point, before the caller's cleanup), so it doesn't need the raw
+        video kept around any longer than usual.
     """
     objects = objects or []
     t0 = time.time()
@@ -47,12 +91,20 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
 
     video_out_dir = os.path.join(save_root, segment_id)
     os.makedirs(video_out_dir, exist_ok=True)
+    viz_dir, viz_vr = None, None
+    if visualize:
+        viz_dir = os.path.join(video_out_dir, "viz")
+        os.makedirs(viz_dir, exist_ok=True)
 
     print(f"[{elapsed():7.1f}s] Resampling video...")
     rs_meta = resample_video(video_path, resampled_path, target_fps, verbose=verbose)
     stride = rs_meta["stride"]
     n_frames_resampled = rs_meta["n_frames_resampled"]
     print(f"[{elapsed():7.1f}s] Resample done.")
+
+    if visualize:
+        decord.bridge.set_bridge("native")
+        viz_vr = decord.VideoReader(resampled_path)
 
     prompt_specs = [("hand", "hand", "a hand.")]
     prompt_specs += [(obj, "object", f"{obj}.") for obj in objects]
@@ -89,8 +141,17 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, resam
             seed_frame = min(f for f, v in info["visible"].items() if v)
             pts = farthest_point_sample(info["seed_mask"], point_budget, margin=point_margin)
             n_visible = sum(1 for v in info["visible"].values() if v)
+            instance_id = f"{info['label']}_{obj_id}"
+            if visualize:
+                frame = viz_vr[seed_frame].asnumpy()
+                color = INSTANCE_COLORS[obj_id % len(INSTANCE_COLORS)]
+                img = draw_seed_visualization(frame, info["seed_mask"], pts, instance_id, color)
+                viz_path = os.path.join(viz_dir, f"{chunk_idx:05d}_{instance_id}.jpg")
+                cv2.imwrite(viz_path, img)
+                if verbose:
+                    print(f"  chunk {chunk_idx}: wrote {viz_path}")
             instances.append({
-                "instance_id": f"{info['label']}_{obj_id}",
+                "instance_id": instance_id,
                 "obj_id": obj_id,
                 "label": info["label"],
                 "category": info["category"],
@@ -171,6 +232,11 @@ def main():
     ap.add_argument("--check-existing", action="store_true", default=False,
                      help="skip a row if its chunk-0 bundle.json already exists (resume mode). Default is to "
                           "overwrite/re-run every row in range.")
+    ap.add_argument("--visualize", action="store_true", default=False,
+                     help="for each tracked instance, save a JPG of its seed frame with the seed mask and "
+                          "query points overlaid, under save-root/<segment_id>/viz/. Off by default since it "
+                          "adds per-instance disk writes; the raw/resampled video itself is always deleted "
+                          "after each row regardless of this flag.")
     ap.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     args = ap.parse_args()
 
@@ -207,7 +273,7 @@ def main():
                 num_checks=args.num_checks, max_frames=args.max_frames, target_fps=args.target_fps,
                 stale_frames=args.stale_frames, box_threshold=args.box_threshold,
                 text_threshold=args.text_threshold, max_concurrent_per_label=args.max_concurrent_per_label,
-                point_margin=args.point_margin, verbose=args.verbose)
+                point_margin=args.point_margin, visualize=args.visualize, verbose=args.verbose)
         except Exception as e:
             print(f"[{seg_id}] FAILED: {e}")
         finally:

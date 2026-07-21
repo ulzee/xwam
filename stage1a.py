@@ -42,7 +42,17 @@ duration_sec used here, so it replays the identical PER-NARRATION download
 it's a separate process and doesn't share stage1a.py's in-progress state).
 """
 import os
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+import sys
+# Checked via raw sys.argv, not argparse, because this has to run BEFORE
+# `from scene_understanding import ...` below -- scene_understanding.py sets
+# HF_HUB_OFFLINE=1 (via setdefault) at its own import time, and transformers
+# reads that env var at import/call time too, so by the time argparse would
+# normally run it's already too late to flip it back off.
+_force_redownload_models = "--force-redownload-models" in sys.argv
+if _force_redownload_models:
+    os.environ["HF_HUB_OFFLINE"] = "0"
+else:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import argparse
 import itertools
 import json
@@ -184,11 +194,12 @@ def run_identify(video_path, narration, verbose=True):
     if verbose:
         print(f"Narration: {narration!r}")
         print("Running Qwen3-VL scene understanding...")
-    task, objects = identify_objects(video_path, narration=narration)
+    task, objects, background = identify_objects(video_path, narration=narration)
     if verbose:
         print(f"  task: {task}")
         print(f"  objects: {objects}")
-    return task, objects
+        print(f"  background: {background}")
+    return task, objects, background
 
 
 def main():
@@ -222,15 +233,24 @@ def main():
                           "downloaded-and-waiting ahead of Qwen inference (producer/consumer backpressure via "
                           "a bounded queue). Combined with the one it's actively downloading, this keeps "
                           "roughly --prefetch + 1 (~2-3 at the default) shared segments on disk at once.")
+    ap.add_argument("--force-redownload-models", action="store_true", default=False,
+                     help="bypass the local HuggingFace cache and re-fetch Qwen3-VL from the Hub, "
+                          "overwriting any existing blobs/symlinks. Use if a resumed AWS instance's HF "
+                          "cache looks present but is actually corrupt (stale/broken snapshot symlinks "
+                          "after a disk swap) -- symptom is usually a load_model() crash or a model that "
+                          "loads but behaves as if weights are missing/garbled. Also disables "
+                          "HF_HUB_OFFLINE for this run, since the two are mutually exclusive.")
     ap.add_argument("--quiet", dest="verbose", action="store_false", default=True)
     args = ap.parse_args()
+    assert args.force_redownload_models == _force_redownload_models, \
+        "internal: argparse and the pre-import sys.argv check disagree on --force-redownload-models"
 
     rows = load_manifest_range(args.manifest, args.start, args.end)
     print(f"Loaded {len(rows)} manifest row(s) in [{args.start}, {args.end if args.end is not None else 'end'})")
     os.makedirs(args.save_root, exist_ok=True)
     os.makedirs(args.tmp_dir, exist_ok=True)
 
-    load_model()
+    load_model(force_download=args.force_redownload_models)
 
     work_queue = queue.Queue(maxsize=args.prefetch)
     producer = threading.Thread(target=download_worker, args=(rows, args, work_queue), daemon=True)
@@ -263,10 +283,11 @@ def main():
             try:
                 if not single:
                     trim_local(raw_path, start_sec - group_start, duration_sec, seg_path)
-                task, objects = run_identify(seg_path, row["narration_text"], verbose=args.verbose)
+                task, objects, background = run_identify(seg_path, row["narration_text"], verbose=args.verbose)
                 with open(identify_path, "w") as f:
                     json.dump({
-                        "task": task, "objects": objects, "narration_text": row["narration_text"],
+                        "task": task, "objects": objects, "background": background,
+                        "narration_text": row["narration_text"],
                         "bucket": row["bucket"], "key": row["key"],
                         "start_sec": start_sec, "duration_sec": duration_sec,
                     }, f, indent=2)

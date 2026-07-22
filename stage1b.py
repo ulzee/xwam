@@ -66,7 +66,7 @@ def draw_seed_visualization(frame_rgb, mask, points_px, label, color):
 def run_track(video_path, save_root, segment_id, narration, task, objects, background_objects, resampled_path,
               download_recipe, point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
               stale_frames=10, box_threshold=0.3, text_threshold=0.25, max_concurrent_per_label=4,
-              point_margin=3, background_point_budget=None, visualize=False, verbose=True):
+              point_margin_pct=3.0, background_point_budget=None, visualize=False, verbose=True):
     """Resamples video_path once, tiles it into consecutive max_frames
     windows ("chunks") from frame 0 to the end of the clip, tracks every
     chunk, writes one bundle.json per chunk to
@@ -153,6 +153,7 @@ def run_track(video_path, save_root, segment_id, narration, task, objects, backg
     )
     print(f"[{elapsed():7.1f}s] Chunk tracking done.")
     native_h, native_w = result["frame_size"]
+    point_margin = round(point_margin_pct / 100 * native_h)
 
     bundle_paths = []
     for chunk_idx, chunk in enumerate(result["chunks"]):
@@ -291,9 +292,11 @@ def main():
     ap.add_argument("--box-threshold", type=float, default=0.3)
     ap.add_argument("--text-threshold", type=float, default=0.25)
     ap.add_argument("--max-concurrent-per-label", type=int, default=4)
-    ap.add_argument("--point-margin", type=int, default=3,
-                     help="erode each instance's seed mask inward by this many pixels before sampling query "
-                          "points, so points land away from the mask boundary. 0 disables this.")
+    ap.add_argument("--point-margin-pct", type=float, default=3.0,
+                     help="erode each instance's seed mask inward before sampling query points, so points land "
+                          "away from the mask boundary. Expressed as a percentage of the video's vertical "
+                          "resolution rather than a fixed pixel count, so the margin scales with source "
+                          "resolution (default 3%% -- e.g. ~43px on a 1440p video). 0 disables this.")
     ap.add_argument("--check-existing", action="store_true", default=False,
                      help="skip a row if its chunk-0 bundle.json already exists (resume mode). Default is to "
                           "overwrite/re-run every row in range.")
@@ -339,7 +342,7 @@ def main():
                 num_checks=args.num_checks, max_frames=args.max_frames, target_fps=args.target_fps,
                 stale_frames=args.stale_frames, box_threshold=args.box_threshold,
                 text_threshold=args.text_threshold, max_concurrent_per_label=args.max_concurrent_per_label,
-                point_margin=args.point_margin, background_point_budget=args.background_point_budget,
+                point_margin_pct=args.point_margin_pct, background_point_budget=args.background_point_budget,
                 visualize=args.visualize, verbose=args.verbose)
         except Exception as e:
             print(f"[{seg_id}] FAILED: {e}")

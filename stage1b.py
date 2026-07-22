@@ -66,7 +66,7 @@ def draw_seed_visualization(frame_rgb, mask, points_px, label, color):
 def run_track(video_path, save_root, segment_id, narration, task, objects, background_objects, resampled_path,
               download_recipe, point_budget=10, check_interval=None, num_checks=3, max_frames=35, target_fps=10,
               stale_frames=10, box_threshold=0.3, text_threshold=0.25, max_concurrent_per_label=4,
-              point_margin_pct=3.0, background_point_budget=None, visualize=False, verbose=True):
+              point_margin_pct=2.5, background_point_budget=None, visualize=False, verbose=True):
     """Resamples video_path once, tiles it into consecutive max_frames
     windows ("chunks") from frame 0 to the end of the clip, tracks every
     chunk, writes one bundle.json per chunk to
@@ -292,11 +292,11 @@ def main():
     ap.add_argument("--box-threshold", type=float, default=0.3)
     ap.add_argument("--text-threshold", type=float, default=0.25)
     ap.add_argument("--max-concurrent-per-label", type=int, default=4)
-    ap.add_argument("--point-margin-pct", type=float, default=3.0,
+    ap.add_argument("--point-margin-pct", type=float, default=2.5,
                      help="erode each instance's seed mask inward before sampling query points, so points land "
                           "away from the mask boundary. Expressed as a percentage of the video's vertical "
                           "resolution rather than a fixed pixel count, so the margin scales with source "
-                          "resolution (default 3%% -- e.g. ~43px on a 1440p video). 0 disables this.")
+                          "resolution (default 2.5%% -- e.g. ~36px on a 1440p video). 0 disables this.")
     ap.add_argument("--check-existing", action="store_true", default=False,
                      help="skip a row if its chunk-0 bundle.json already exists (resume mode). Default is to "
                           "overwrite/re-run every row in range.")

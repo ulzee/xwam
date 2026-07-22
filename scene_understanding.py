@@ -141,6 +141,29 @@ def is_excluded(name):
     return bool(words) and words[-1] in EXCLUDED_KEYWORDS
 
 
+def normalize_name(name):
+    return re.sub(r"\s+", " ", name.strip().lower())
+
+
+def dedupe_preserve_order(items, exclude_normalized=frozenset()):
+    """Drops exact-duplicate (case/whitespace-insensitive) names, keeping
+    the first occurrence's original casing -- Qwen sometimes repeats the
+    same item verbatim or with only whitespace/case differences, especially
+    in the less-constrained "background" list. `exclude_normalized` lets a
+    caller also drop names already claimed elsewhere (e.g. background items
+    that duplicate an objects item -- objects should win, same as stage1b's
+    mask-collision resolution)."""
+    seen = set(exclude_normalized)
+    deduped = []
+    for item in items:
+        key = normalize_name(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
 def identify(video_path, narration=DEFAULT_NARRATION, fps=2.0, max_pixels=360 * 640, max_new_tokens=768):
     model, processor = load_model()
     prompt = PROMPT_TEMPLATE.format(narration=narration)
@@ -185,12 +208,19 @@ def identify_objects(video_path, narration=DEFAULT_NARRATION, **kwargs):
     """Returns (task_description, filtered_object_list, filtered_background_list).
     `objects` is what gets tracked (GDINO+SAM2 in stage1b.py); `background`
     is untouched/uninvolved items the model was told to overindex on --
-    kept only as negatives, never fed into tracking."""
+    kept only as negatives, never fed into tracking.
+
+    Both lists are deduped (case/whitespace-insensitive) since Qwen
+    sometimes repeats an item, especially in the uncapped "background"
+    list. Background is additionally deduped against the final objects
+    list -- if Qwen lists the same item in both, objects wins, same as
+    stage1b's own objects-override-background collision handling."""
     raw = identify(video_path, narration=narration, **kwargs)
     parsed = parse_json_response(raw)
     task = parsed.get("task", "")
-    objects = [o for o in parsed.get("objects", []) if not is_excluded(o)]
-    background = [o for o in parsed.get("background", []) if not is_excluded(o)]
+    objects = dedupe_preserve_order(o for o in parsed.get("objects", []) if not is_excluded(o))
+    background_raw = [o for o in parsed.get("background", []) if not is_excluded(o)]
+    background = dedupe_preserve_order(background_raw, exclude_normalized={normalize_name(o) for o in objects})
     return task, objects, background
 
 
